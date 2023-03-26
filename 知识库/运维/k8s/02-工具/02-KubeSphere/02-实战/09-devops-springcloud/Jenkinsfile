@@ -1,0 +1,187 @@
+pipeline {
+    agent {
+        node {
+            label 'maven'
+        }
+    }
+
+    environment {
+        DOCKER_REGISTRY_AUTH = "aliyun-docker-registry-auth"
+        DOCKER_REGISTRY = 'registry.cn-hangzhou.aliyuncs.com/zhengqingya'
+        PROJECT_GIT_URL = 'https://gitee.com/zhengqingya/small-tools.git'
+        // 需要处理的服务
+        SERVICE_HANDLE_LIST = ""
+        K8S_NAMESPACE = "my-project"
+        BASE_PROJECT_URL = "small-tools-api/"
+        // TODO KubeSphere中配置流水线构建参数 => 动态传参进来
+        // BRANCH_NAME = 'dev'
+        // IS_SKIP_BUILD = 'false'
+        // JAVA_OPTS = "-XX:+UseG1GC -Xms100m -Xmx100m -Dserver.port=8080"
+        // SERVICE_NAMES = "demo,gateway"
+        APP_REPLICAS = "1"
+        MAIL_RECEIVE_USER = "xxx@qq.com,xxx@qq.com"
+    }
+
+//    parameters {
+//        string(name: 'BRANCH_NAME', defaultValue: 'master', description: 'git分支名')
+//        string(name: 'SERVICE_NAMES', defaultValue: 'auth, gateway, demo, mall-mini, mall-web, system, tool', description: '请选择要构建的服务,英文逗号分隔')
+//        choice(name: 'IS_SKIP_BUILD', choices: ['false', 'true'], description: '是否跳过构建,直接部署')
+//        choice(name: 'IS_BUILD_ALL_SERVICE', choices: ['false', 'true'], description: '是否全部服务部署')
+//        string(name: 'JAVA_OPTS', defaultValue: '-XX:+UseG1GC -Xms100m -Xmx100m -Dserver.port=8080', description: 'java运行参数')
+//        string(name: 'APP_REPLICAS', defaultValue: '1', description: '部署副本数量')
+//        string(name: 'MAIL_RECEIVE_USER', defaultValue: 'xxx@qq.com,xxx@qq.com', description: '邮件通知接收人')
+//    }
+
+    stages {
+
+        stage('初始化准备') {
+            agent none
+            steps {
+                container('maven') {
+                    script {
+                        SERVICE_HANDLE_LIST = "${SERVICE_NAMES}".split(",")
+                        sh """
+                            echo "分支: ${BRANCH_NAME}"
+                            echo "是否跳过构建，直接部署(tips:适用于之前已经进行过构建打包的情景)：${IS_SKIP_BUILD}"
+                            echo "构建运行ID: ${BUILD_NUMBER}"
+                            echo "JAVA_OPTS: ${JAVA_OPTS}"
+                            echo "待处理服务: ${SERVICE_HANDLE_LIST}"
+                        """
+                        // 镜像仓库认证
+                        withCredentials([usernamePassword(credentialsId: "${DOCKER_REGISTRY_AUTH}", passwordVariable: 'DOCKER_PASSWORD', usernameVariable: 'DOCKER_USERNAME',)]) {
+                            sh 'echo "$DOCKER_PASSWORD" | docker login $DOCKER_REGISTRY -u "$DOCKER_USERNAME" --password-stdin'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('拉取代码') {
+            agent none
+            steps {
+                container('maven') {
+                    git(credentialsId: 'gitee-auth', url: "${PROJECT_GIT_URL}", branch: "${BRANCH_NAME}", changelog: true, poll: false)
+                    sh 'ls -al'
+                }
+            }
+        }
+
+        stage('项目打包') {
+            agent none
+            steps {
+                container('maven') {
+                    script {
+                        if ("${IS_SKIP_BUILD}" != "true") {
+                            sh """
+                                cd ${BASE_PROJECT_URL}
+                                mvn clean package -Dmaven.test.skip=true
+                                ls -al
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('docker镜像-构建&推送') {
+            agent none
+            steps {
+                container('maven') {
+                    script {
+                        if ("${IS_SKIP_BUILD}" != "true") {
+                            for (service in SERVICE_HANDLE_LIST) {
+                                stage("*** build&push ${service}") {
+                                    def jar_dir_prefix = ""
+                                    service = "${service}".trim()
+                                    echo "****** 处理服务：${service}"
+                                    switch ("${service}") {
+                                        case "gateway":
+                                            jar_dir_prefix = "${BASE_PROJECT_URL}/${service}"
+                                            break
+                                        case "mall-mini":
+                                        case "mall-web":
+                                            jar_dir_prefix = "${BASE_PROJECT_URL}/" + "service/" + "${service}".split("-")[0] + "/${service}"
+                                            break
+                                        case "demo":
+                                        case "pay":
+                                        case "system":
+                                        case "tool":
+                                        case "ums":
+                                            jar_dir_prefix = "${BASE_PROJECT_URL}/service/${service}"
+                                            break
+                                    }
+                                    def APP_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${service}:${BRANCH_NAME}"
+
+                                    // 删除旧容器
+//                                    sh "docker ps -a | grep ${service} | awk '{print \$1}' | xargs -i docker stop {} | xargs -i docker rm {}"
+                                    // 删除旧镜像
+//                                    sh "docker images | grep -E ${service} | awk '{print \$3}' | uniq | xargs -I {} docker rmi --force {}"
+
+                                    sh """
+                                        pwd
+                                        rm -rf ${BASE_PROJECT_URL}/docker/*.jar
+                                        cp ${jar_dir_prefix}/target/*.jar ${BASE_PROJECT_URL}/docker
+                                        cd ${BASE_PROJECT_URL}/docker
+                                        ls
+                                        echo "app镜像: ${APP_DOCKER_IMAGE}"
+                                        docker build -f Dockerfile --build-arg APP_NAME="${service}" --build-arg APP_PORT="8080" -t ${APP_DOCKER_IMAGE} . --no-cache
+                                        docker push ${APP_DOCKER_IMAGE}
+                                        echo 镜像推送成功：${APP_DOCKER_IMAGE}
+                                    """
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage('发布到k8s') {
+            agent none
+            steps {
+                container('maven') {
+                    script {
+                        for (service in SERVICE_HANDLE_LIST) {
+                            stage("*** deploy ${service}") {
+                                service = "${service}".trim()
+                                println "****** 部署服务：${service}"
+                                // 自定义全局变量 => 整个流水线使用
+                                env.APP_NAME = "${service}"
+                                env.APP_DOCKER_IMAGE = "${DOCKER_REGISTRY}/${service}:${BRANCH_NAME}"
+                                withCredentials([kubeconfigFile(credentialsId: 'kubeconfig-auth', variable: 'KUBECONFIG')]) {
+                                    if ("${service}" == "gateway") {
+                                        env.APP_PORT = 1218
+                                        env.APP_SENTINEL_PORT = 8719
+                                        env.JAVA_OPTS = " -Dserver.port=${APP_PORT} -Dspring.cloud.sentinel.transport.port=${APP_SENTINEL_PORT} ${JAVA_OPTS}"
+                                        // 先刪除旧pod -- 解决同一版本镜像更新后不重建pod问题
+                                        sh 'envsubst < ${BASE_PROJECT_URL}/k8s/k8s-deploy-gateway.yml | kubectl delete -f -'
+                                        // 再创建新pod
+                                        sh 'envsubst < ${BASE_PROJECT_URL}/k8s/k8s-deploy-gateway.yml | kubectl apply -f -'
+                                    } else {
+                                        env.APP_PORT = 8080
+                                        env.APP_SENTINEL_PORT = 8719
+                                        env.JAVA_OPTS = " -Dserver.port=${APP_PORT} -Dspring.cloud.sentinel.transport.port=${APP_SENTINEL_PORT} ${JAVA_OPTS}"
+                                        sh 'envsubst < ${BASE_PROJECT_URL}/k8s/k8s-deploy-service.yml | kubectl delete -f -'
+                                        sh 'envsubst < ${BASE_PROJECT_URL}/k8s/k8s-deploy-service.yml | kubectl apply -f -'
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+//        stage('邮件通知') {
+//            agent none
+//            steps {
+//                container('base') {
+//                    mail(to: "${MAIL_RECEIVE_USER}", subject: '服务部署成功通知', body: "部署分支：${BRANCH_NAME}  \n 运行ID：${BUILD_NUMBER}  \n 部署服务：${SERVICE_NAMES} ")
+//                }
+//            }
+//        }
+
+    }
+}
